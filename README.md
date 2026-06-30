@@ -2,7 +2,7 @@
 
 BookMySlot is a premium, multi-tenant appointment scheduling and booking platform tailored for local Indian service businesses (salons, health clinics, coaching centers, and other professional service providers). It features role-based access control, tenant isolation, dynamic slot generation with buffer times, real-time dashboards, automated email confirmations, and a unified customer discovery flow.
 
----
+----
 
 ## Key Features
 
