@@ -1,6 +1,12 @@
 import React from 'react';
 import Hero from '../components/landing/Hero';
 import Features from '../components/landing/Features';
+import Showcase from '../components/landing/Showcase';
+import About from '../components/landing/About';
+import FAQ from '../components/landing/FAQ';
+import Testimonials from '../components/landing/Testimonials';
+import Contact from '../components/landing/Contact';
+import Footer from '../components/landing/Footer';
 import { CustomerNavbar } from '../components/layout/CustomerNavbar';
 
 export const LandingPage: React.FC = () => {
@@ -10,12 +16,15 @@ export const LandingPage: React.FC = () => {
 
       <main className="flex-1">
         <Hero />
+        <Showcase />
         <Features />
+        <About />
+        <Testimonials />
+        <FAQ />
+        <Contact />
       </main>
 
-      <footer className="border-t border-zinc-900 py-8 bg-zinc-950 text-center text-[10px] text-zinc-500 tracking-wider uppercase font-medium">
-        © {new Date().getFullYear()} BookMySlot Platform. All Rights Reserved.
-      </footer>
+      <Footer />
     </div>
   );
 };
