@@ -24,7 +24,7 @@ export const CustomerNavbar: React.FC = () => {
               {user?.role === 'customer' && (
                 <Link
                   to="/my-bookings"
-                  className="flex items-center gap-1.5 text-xs font-semibold text-zinc-650 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
+                  className="flex items-center gap-1.5 text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
                 >
                   <Calendar className="h-3.5 w-3.5" />
                   My Bookings
@@ -33,7 +33,7 @@ export const CustomerNavbar: React.FC = () => {
               {user?.role === 'business_owner' && (
                 <Link
                   to="/dashboard"
-                  className="text-xs font-semibold text-zinc-650 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
+                  className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
                 >
                   Dashboard
                 </Link>
@@ -41,7 +41,7 @@ export const CustomerNavbar: React.FC = () => {
               {user?.role === 'super_admin' && (
                 <Link
                   to="/admin"
-                  className="text-xs font-semibold text-zinc-650 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
+                  className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-all mr-2"
                 >
                   Admin Console
                 </Link>
