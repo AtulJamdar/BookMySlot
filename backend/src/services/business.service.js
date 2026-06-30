@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Business = require('../models/Business');
+const Service = require('../models/Service');
 const AuditLog = require('../models/AuditLog');
 
 const getBusinessBySlug = async (slug) => {
@@ -51,20 +52,21 @@ const listBusinesses = async (filters, page = 1, limit = 10) => {
   }
 
   if (filters.search) {
-    const searchRegex = new RegExp(filters.search, 'i');
-    
-    // Find services matching name
-    const Service = mongoose.models.Service;
-    let businessIdsFromServices = [];
-    if (Service) {
-      const matchingServices = await Service.find({ name: searchRegex }).select('businessId');
-      businessIdsFromServices = matchingServices.map(s => s.businessId);
+    const words = filters.search.split(/\s+/).filter(Boolean);
+    if (words.length > 0) {
+      const regexes = words.map(w => new RegExp(w, 'i'));
+      
+      // Find services matching any word
+      const matchingServices = await Service.find({
+        $or: regexes.map(r => ({ name: r }))
+      }).select('businessId');
+      const businessIdsFromServices = matchingServices.map(s => s.businessId);
+      
+      query.$or = [
+        ...regexes.map(r => ({ name: r })),
+        { _id: { $in: businessIdsFromServices } }
+      ];
     }
-    
-    query.$or = [
-      { name: searchRegex },
-      { _id: { $in: businessIdsFromServices } }
-    ];
   }
 
   const items = await Business.find(query)
