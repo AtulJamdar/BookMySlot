@@ -29,7 +29,7 @@ export const FAQ: React.FC = () => {
   ];
 
   return (
-    <section className="min-h-screen flex flex-col justify-center bg-white dark:bg-zinc-950/40 border-y border-zinc-200 dark:border-zinc-900 font-sans py-16">
+    <section className="min-h-screen flex flex-col justify-center bg-white dark:bg-black border-y border-zinc-200 dark:border-zinc-900 font-sans py-16">
       <div className="max-w-3xl mx-auto px-6 space-y-12 w-full">
         <div className="text-center space-y-3">
           <span className="text-[10px] font-extrabold tracking-widest text-amber-500 uppercase">
