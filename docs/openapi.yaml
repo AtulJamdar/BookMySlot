@@ -1,0 +1,3489 @@
+openapi: 3.0.3
+
+info:
+  title: BookMySlot API
+  description: |
+    ## Overview
+    BookMySlot is a multi-tenant appointment booking backend for Indian local service
+    businesses (salons, clinics, coaching centres). A single Express.js server and
+    MongoDB Atlas cluster serve every registered business; tenant isolation is enforced
+    at the middleware layer via the authenticated user's `businessId` JWT claim.
+
+    ## Authentication
+    Protected endpoints require a Bearer JWT in the `Authorization` header:
+    ```
+    Authorization: Bearer <token>
+    ```
+    JWTs are issued on login and expire after **7 days**. The payload contains
+    `{ userId, role, businessId }`.
+
+    ## Roles
+    | Role | Symbol used in this spec |
+    |---|---|
+    | Business Owner | `OWNER` |
+    | Customer | `CUSTOMER` |
+    | Super Admin | `ADMIN` |
+    | Public (no auth) | `PUBLIC` |
+
+    ## Multi-Tenancy
+    Every resource that belongs to a business carries a `businessId` field.
+    Middleware automatically injects `req.businessId` from the JWT claim and
+    appends it to all Mongoose queries. An owner **cannot** read or mutate
+    another tenant's data — the server returns `403 FORBIDDEN` if the resolved
+    businessId does not match the resource's businessId.
+
+    ## Standard Response Envelope
+    All responses (success and error) use the same outer shape:
+    ```json
+    { "success": true,  "data": { … } }
+    { "success": false, "error": { "code": "…", "message": "…", "statusCode": 400 } }
+    ```
+
+    ## Error Codes
+    | HTTP | Code | Meaning |
+    |---|---|---|
+    | 400 | `VALIDATION_ERROR` | Invalid or missing input |
+    | 401 | `UNAUTHORIZED` | Missing or expired JWT |
+    | 403 | `FORBIDDEN` | Role or tenant mismatch |
+    | 404 | `NOT_FOUND` | Resource not found |
+    | 409 | `SLOT_UNAVAILABLE` | Slot taken by concurrent booking |
+    | 429 | `RATE_LIMITED` | Too many requests |
+    | 500 | `INTERNAL_ERROR` | Unexpected server error |
+
+  version: 1.0.0
+  contact:
+    name: BookMySlot Team
+
+servers:
+  - url: https://bookmyslot-api.onrender.com/api
+    description: Production (Render)
+  - url: http://localhost:5000/api
+    description: Local development
+
+tags:
+  - name: Auth
+    description: Registration, login, logout, and session endpoints
+  - name: Business
+    description: Business profile management and configuration
+  - name: Services
+    description: Bookable services offered by a business
+  - name: Staff
+    description: Staff members who deliver services
+  - name: TimeSlots
+    description: Slot generation, availability queries, and blocking
+  - name: Bookings
+    description: Appointment creation, viewing, and status updates
+  - name: Analytics
+    description: Revenue, booking metrics, and peak-hours data
+  - name: Admin
+    description: Super Admin cross-tenant management console
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+paths:
+
+  # ══════════════════════════════════════════
+  # AUTH
+  # ══════════════════════════════════════════
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new business owner
+      description: |
+        Creates a **Business Owner** user account and an associated Business document
+        in a single atomic MongoDB transaction. Returns a signed JWT on success.
+        A welcome email is sent asynchronously; email failure does not block the response.
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** Creates a new tenant (Business document) on success.
+        **Rate limit:** 10 requests / 15 min per IP.
+      operationId: registerOwner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterOwnerRequest'
+            example:
+              name: "Priya Sharma"
+              email: "priya@sunshinesalon.in"
+              password: "Secure@123"
+              phone: "9876543210"
+              businessName: "Sunshine Salon"
+              category: "salon"
+              city: "Pune"
+              description: "Premium unisex salon in Koregaon Park"
+      responses:
+        '201':
+          description: Owner and business created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                success: true
+                data:
+                  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                  user:
+                    id: "64a1f2c3e4b5d6f7a8b9c0d1"
+                    name: "Priya Sharma"
+                    email: "priya@sunshinesalon.in"
+                    role: "business_owner"
+                    businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                    phone: "9876543210"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "EMAIL_TAKEN"
+                  message: "An account with this email already exists."
+                  statusCode: 409
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/register/customer:
+    post:
+      tags: [Auth]
+      summary: Register a new customer account
+      description: |
+        Creates a **Customer** user account. Kept separate from owner registration
+        to avoid role ambiguity. No business document is created.
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** Customers are not scoped to a tenant at registration.
+        **Rate limit:** 10 requests / 15 min per IP.
+      operationId: registerCustomer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterCustomerRequest'
+            example:
+              name: "Rohan Kulkarni"
+              email: "rohan@example.com"
+              password: "MyPass@456"
+              phone: "9988776655"
+      responses:
+        '201':
+          description: Customer account created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                success: true
+                data:
+                  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                  user:
+                    id: "64a9b8c7d6e5f4a3b2c1d0e9"
+                    name: "Rohan Kulkarni"
+                    email: "rohan@example.com"
+                    role: "customer"
+                    businessId: null
+                    phone: "9988776655"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login (all roles)
+      description: |
+        Accepts email and password for any role (Business Owner, Customer, Super Admin).
+        Returns a signed JWT containing `{ userId, role, businessId }`.
+
+        **Auth:** `PUBLIC`
+        **Rate limit:** 10 requests / 15 min per IP.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: "priya@sunshinesalon.in"
+              password: "Secure@123"
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                success: true
+                data:
+                  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                  user:
+                    id: "64a1f2c3e4b5d6f7a8b9c0d1"
+                    name: "Priya Sharma"
+                    email: "priya@sunshinesalon.in"
+                    role: "business_owner"
+                    businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                    phone: "9876543210"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "UNAUTHORIZED"
+                  message: "Invalid email or password."
+                  statusCode: 401
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout current session
+      description: |
+        Invalidates the current session. Because JWTs are stateless, the primary
+        action on the server side is to clear any server-side token blocklist entry
+        (if implemented) and signal the frontend to delete the stored token.
+        The client must delete the token from localStorage on receipt of this response.
+
+        **Auth:** `OWNER | CUSTOMER | ADMIN`
+      operationId: logout
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Logged out successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              example:
+                success: true
+                data:
+                  message: "Logged out successfully."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current authenticated user
+      description: |
+        Decodes the JWT and returns the current user's profile. Used by the
+        frontend to restore session state on page refresh without storing user
+        data in localStorage beyond the token itself.
+
+        **Auth:** `OWNER | CUSTOMER | ADMIN`
+        **Tenant note:** Returns only the caller's own data.
+      operationId: getMe
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserProfile'
+              example:
+                success: true
+                data:
+                  id: "64a1f2c3e4b5d6f7a8b9c0d1"
+                  name: "Priya Sharma"
+                  email: "priya@sunshinesalon.in"
+                  role: "business_owner"
+                  businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                  phone: "9876543210"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # BUSINESS
+  # ══════════════════════════════════════════
+
+  /businesses:
+    get:
+      tags: [Admin]
+      summary: List all businesses (Super Admin)
+      description: |
+        Returns a paginated list of all registered businesses across all tenants.
+        Includes booking count aggregated per business.
+        Supports filtering by `isActive` status.
+
+        **Auth:** `ADMIN`
+        **Tenant note:** No tenant scoping — Super Admin sees all tenants.
+      operationId: listAllBusinesses
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: isActive
+          in: query
+          required: false
+          description: Filter by active/suspended status
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Paginated list of all businesses
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          businesses:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/BusinessAdminView'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+              example:
+                success: true
+                data:
+                  businesses:
+                    - id: "64a1f2c3e4b5d6f7a8b9c0d2"
+                      name: "Sunshine Salon"
+                      slug: "sunshine-salon"
+                      category: "salon"
+                      city: "Pune"
+                      isActive: true
+                      bookingCount: 142
+                      createdAt: "2026-01-10T06:00:00.000Z"
+                  pagination:
+                    total: 34
+                    page: 1
+                    limit: 20
+                    pages: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [Business]
+      summary: Create a business
+      description: |
+        Creates a Business document and links it to the authenticated owner.
+        In normal flow this is called internally by `POST /auth/register`. Exposed
+        here for direct use (e.g., Super Admin creating a business on behalf of an owner).
+
+        **Auth:** `OWNER | ADMIN`
+        **Tenant note:** Creates a new tenant. The authenticated owner becomes the business owner.
+      operationId: createBusiness
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBusinessRequest'
+            example:
+              name: "Sunshine Salon"
+              category: "salon"
+              city: "Pune"
+              phone: "9876543210"
+              description: "Premium unisex salon"
+              workingHours:
+                - day: "monday"
+                  start: "09:00"
+                  end: "19:00"
+                - day: "tuesday"
+                  start: "09:00"
+                  end: "19:00"
+              bufferMinutes: 10
+      responses:
+        '201':
+          description: Business created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Business'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{slug}:
+    get:
+      tags: [Business]
+      summary: Get public business profile by slug
+      description: |
+        Returns the public-facing business profile. Called when a customer visits
+        `/b/:slug` on the frontend to load business info and begin the booking flow.
+        Returns `404` if the business does not exist, and `403` if `isActive` is false
+        (suspended businesses are invisible to the public).
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** Slug uniquely identifies one tenant. No cross-tenant risk.
+      operationId: getBusinessBySlug
+      parameters:
+        - $ref: '#/components/parameters/slug'
+      responses:
+        '200':
+          description: Business profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/BusinessPublic'
+              example:
+                success: true
+                data:
+                  id: "64a1f2c3e4b5d6f7a8b9c0d2"
+                  name: "Sunshine Salon"
+                  slug: "sunshine-salon"
+                  category: "salon"
+                  city: "Pune"
+                  phone: "9876543210"
+                  description: "Premium unisex salon in Koregaon Park"
+                  workingHours:
+                    - day: "monday"
+                      start: "09:00"
+                      end: "19:00"
+                  bufferMinutes: 10
+                  isActive: true
+        '403':
+          description: Business is suspended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "FORBIDDEN"
+                  message: "This business is currently unavailable."
+                  statusCode: 403
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{id}:
+    put:
+      tags: [Business]
+      summary: Update own business profile (Owner)
+      description: |
+        Allows a Business Owner to update their business profile fields.
+        The server validates `req.user.businessId === req.params.id`; a mismatch
+        returns `403`. If `name` changes, a new slug is generated and checked for
+        global uniqueness.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Strictly scoped — owner can only update their own business.
+      operationId: updateBusiness
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBusinessRequest'
+            example:
+              name: "Sunshine Salon & Spa"
+              phone: "9123456789"
+              description: "Full-service unisex salon and spa"
+              bufferMinutes: 15
+      responses:
+        '200':
+          description: Business updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Business'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{id}/suspend:
+    patch:
+      tags: [Admin]
+      summary: Suspend or reactivate a business (Super Admin)
+      description: |
+        Toggles `isActive` on a Business document to `true` or `false`.
+        When `isActive` is set to `false`, the business's public booking page
+        immediately returns a 403 to all visitors.
+        Every toggle is written to the `AuditLog` collection with the admin's
+        userId, timestamp, and the previous/new state.
+
+        **Auth:** `ADMIN`
+        **Tenant note:** No tenant scope — Admin can target any business.
+      operationId: suspendBusiness
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuspendBusinessRequest'
+            examples:
+              suspend:
+                summary: Suspend a business
+                value:
+                  isActive: false
+                  reason: "Fraudulent bookings reported"
+              reactivate:
+                summary: Reactivate a business
+                value:
+                  isActive: true
+                  reason: "Issue resolved by owner"
+      responses:
+        '200':
+          description: Business suspension state updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          name:
+                            type: string
+                          isActive:
+                            type: boolean
+                          auditLogId:
+                            type: string
+              example:
+                success: true
+                data:
+                  id: "64a1f2c3e4b5d6f7a8b9c0d2"
+                  name: "Sunshine Salon"
+                  isActive: false
+                  auditLogId: "64f9e8d7c6b5a4938271605e"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{id}/block-days:
+    post:
+      tags: [Business]
+      summary: Block full days off (holidays, closures)
+      description: |
+        Creates `TimeSlot` documents with `status: blocked` spanning the entire
+        working day for all staff on the given dates. Useful for public holidays,
+        sudden closures, or owner leave. All computed slots for those dates become
+        unavailable to customers.
+
+        **Auth:** `OWNER`
+        **Tenant note:** `id` must match `req.user.businessId`; enforced by tenant guard.
+      operationId: blockDays
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BlockDaysRequest'
+            example:
+              dates:
+                - "2026-08-15"
+                - "2026-08-16"
+              reason: "Independence Day long weekend"
+      responses:
+        '200':
+          description: Days blocked successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          blockedDates:
+                            type: array
+                            items:
+                              type: string
+                              format: date
+                          slotsCreated:
+                            type: integer
+                            description: Number of TimeSlot documents created
+              example:
+                success: true
+                data:
+                  blockedDates: ["2026-08-15", "2026-08-16"]
+                  slotsCreated: 2
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{id}/working-hours:
+    put:
+      tags: [Business]
+      summary: Set business working hours
+      description: |
+        Replaces the entire `workingHours` array on the Business document.
+        Omitting a day of the week implies the business is closed that day.
+        `start` and `end` must be in `HH:MM` 24-hour format; `end` must be after `start`.
+
+        **Auth:** `OWNER`
+        **Tenant note:** `id` must match `req.user.businessId`.
+      operationId: setWorkingHours
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetWorkingHoursRequest'
+            example:
+              workingHours:
+                - day: "monday"
+                  start: "09:00"
+                  end: "19:00"
+                - day: "tuesday"
+                  start: "09:00"
+                  end: "19:00"
+                - day: "wednesday"
+                  start: "09:00"
+                  end: "19:00"
+                - day: "thursday"
+                  start: "09:00"
+                  end: "19:00"
+                - day: "friday"
+                  start: "09:00"
+                  end: "20:00"
+                - day: "saturday"
+                  start: "10:00"
+                  end: "18:00"
+      responses:
+        '200':
+          description: Working hours updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Business'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # SERVICES
+  # ══════════════════════════════════════════
+
+  /businesses/{businessId}/services:
+    get:
+      tags: [Services]
+      summary: List active services for a business
+      description: |
+        Returns all services where `isActive: true` for the given business.
+        Used on the public booking page to populate service selection.
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** `businessId` path param scopes the query — no cross-tenant leakage.
+      operationId: listServices
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+      responses:
+        '200':
+          description: List of active services
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Service'
+              example:
+                success: true
+                data:
+                  - id: "64b2a3d4e5f6g7h8i9j0k1l2"
+                    businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                    name: "Haircut & Styling"
+                    description: "Precision cut with blowdry finish"
+                    durationMinutes: 45
+                    priceINR: 500
+                    isActive: true
+                    createdAt: "2026-01-15T10:30:00.000Z"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [Services]
+      summary: Create a new service
+      description: |
+        Creates a service scoped to the authenticated owner's business.
+        `durationMinutes` must be a **positive multiple of 15**. `priceINR` must
+        be ≥ 0 (free consultations are allowed). Service names are unique
+        (case-insensitive) within a business.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Service is automatically scoped to `req.businessId` from JWT;
+        the `businessId` path param is verified against the JWT claim.
+      operationId: createService
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateServiceRequest'
+            example:
+              name: "Hair Colour (Global)"
+              description: "Full head colour with ammonia-free dye"
+              durationMinutes: 90
+              priceINR: 1800
+      responses:
+        '201':
+          description: Service created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Service'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Service name already exists in this business
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "DUPLICATE_NAME"
+                  message: "A service with this name already exists."
+                  statusCode: 409
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/services/{serviceId}:
+    put:
+      tags: [Services]
+      summary: Update a service
+      description: |
+        Updates any editable field on a service. The tenant guard verifies
+        `service.businessId === req.businessId` before applying changes.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Tenant guard applied — mismatched `businessId` returns 403.
+      operationId: updateService
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - $ref: '#/components/parameters/serviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateServiceRequest'
+            example:
+              priceINR: 2000
+              durationMinutes: 120
+      responses:
+        '200':
+          description: Service updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Service'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [Services]
+      summary: Soft-delete a service
+      description: |
+        Sets `isActive: false` on the service. The service is immediately hidden
+        from the public booking page. Existing bookings referencing this service
+        are preserved for historical record. Hard deletion is not supported.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Tenant guard applied.
+      operationId: deleteService
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - $ref: '#/components/parameters/serviceId'
+      responses:
+        '200':
+          description: Service deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              example:
+                success: true
+                data:
+                  message: "Service deactivated successfully."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # STAFF
+  # ══════════════════════════════════════════
+
+  /businesses/{businessId}/staff:
+    get:
+      tags: [Staff]
+      summary: List active staff for a business
+      description: |
+        Returns all active staff members. Optionally filtered by `serviceId` to
+        show only staff who offer a specific service — used in step 2 of the
+        booking wizard ("Select a staff member").
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** `businessId` path param scopes query.
+      operationId: listStaff
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: serviceId
+          in: query
+          required: false
+          description: Filter to show only staff assigned to this service
+          schema:
+            type: string
+          example: "64b2a3d4e5f6g7h8i9j0k1l2"
+      responses:
+        '200':
+          description: List of active staff
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Staff'
+              example:
+                success: true
+                data:
+                  - id: "64c3b4e5f6a7b8c9d0e1f2a3"
+                    businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                    name: "Anjali Desai"
+                    title: "Senior Stylist"
+                    serviceIds: ["64b2a3d4e5f6g7h8i9j0k1l2"]
+                    workingHours:
+                      - day: "monday"
+                        start: "09:00"
+                        end: "18:00"
+                    isActive: true
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags: [Staff]
+      summary: Add a staff member
+      description: |
+        Creates a staff member linked to the owner's business. `serviceIds` must
+        all belong to the same business — server validates this. Staff members are
+        not system users and have no login credentials in V1.
+        If `workingHours` is omitted, the staff member inherits the business's
+        working hours at slot-generation time.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Staff automatically scoped to `req.businessId`.
+      operationId: createStaff
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStaffRequest'
+            example:
+              name: "Rahul Mehra"
+              title: "Hair Colour Specialist"
+              serviceIds:
+                - "64b2a3d4e5f6g7h8i9j0k1l2"
+              workingHours:
+                - day: "tuesday"
+                  start: "10:00"
+                  end: "19:00"
+                - day: "wednesday"
+                  start: "10:00"
+                  end: "19:00"
+      responses:
+        '201':
+          description: Staff member created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Staff'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/staff/{staffId}:
+    put:
+      tags: [Staff]
+      summary: Update a staff member
+      description: |
+        Updates name, title, serviceIds, or workingHours. If `serviceIds` is
+        updated, all IDs are re-validated as belonging to the same business.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Tenant guard applied.
+      operationId: updateStaff
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - $ref: '#/components/parameters/staffId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStaffRequest'
+            example:
+              title: "Master Stylist"
+              serviceIds:
+                - "64b2a3d4e5f6g7h8i9j0k1l2"
+                - "64b2a3d4e5f6g7h8i9j0k1l9"
+      responses:
+        '200':
+          description: Staff updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Staff'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [Staff]
+      summary: Soft-delete a staff member
+      description: |
+        Sets `isActive: false`. Staff member disappears from booking flow.
+        Historical bookings referencing this staff member are preserved.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Tenant guard applied.
+      operationId: deleteStaff
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - $ref: '#/components/parameters/staffId'
+      responses:
+        '200':
+          description: Staff member deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              example:
+                success: true
+                data:
+                  message: "Staff member deactivated successfully."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # TIMESLOTS
+  # ══════════════════════════════════════════
+
+  /businesses/{businessId}/timeslots/available:
+    get:
+      tags: [TimeSlots]
+      summary: Query available booking slots (public)
+      description: |
+        **Core availability algorithm** — computes available booking windows for
+        a given date, service, and optional staff member. No pre-stored slots are
+        returned; availability is calculated on demand:
+
+        1. Resolve `service.durationMinutes` and staff working hours for the day-of-week
+        2. Generate all possible windows from `workingHours.start` stepping by `durationMinutes`
+        3. Subtract windows overlapping any `confirmed` Booking or `blocked` TimeSlot
+        4. Remove elapsed windows if `date` is today (IST)
+        5. Apply `bufferMinutes` gap between windows if set on the business
+
+        If `staffId` is omitted, returns aggregate availability across all staff
+        who offer the service, labelling each slot with the staff member it belongs to.
+
+        **Auth:** `PUBLIC`
+        **Tenant note:** `businessId` path param scopes query.
+        **Performance target:** < 800ms p95.
+      operationId: getAvailableSlots
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: date
+          in: query
+          required: true
+          description: Date to query availability for (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+          example: "2026-07-15"
+        - name: serviceId
+          in: query
+          required: true
+          description: ID of the service to book (determines slot duration)
+          schema:
+            type: string
+          example: "64b2a3d4e5f6g7h8i9j0k1l2"
+        - name: staffId
+          in: query
+          required: false
+          description: Optional — limit results to a specific staff member
+          schema:
+            type: string
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+      responses:
+        '200':
+          description: Available slot windows
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          date:
+                            type: string
+                            format: date
+                          serviceId:
+                            type: string
+                          durationMinutes:
+                            type: integer
+                          slots:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/AvailableSlot'
+              example:
+                success: true
+                data:
+                  date: "2026-07-15"
+                  serviceId: "64b2a3d4e5f6g7h8i9j0k1l2"
+                  durationMinutes: 45
+                  slots:
+                    - startTime: "09:00"
+                      endTime: "09:45"
+                      staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                      staffName: "Anjali Desai"
+                    - startTime: "09:45"
+                      endTime: "10:30"
+                      staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                      staffName: "Anjali Desai"
+                    - startTime: "11:15"
+                      endTime: "12:00"
+                      staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                      staffName: "Anjali Desai"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/timeslots/generate:
+    post:
+      tags: [TimeSlots]
+      summary: Block a specific time slot (Owner)
+      description: |
+        Creates a `TimeSlot` document with `status: blocked` for a specific
+        staff member on a specific date and time window. Used for ad-hoc blocks
+        (e.g., lunch breaks, early departures, personal leave windows).
+        For full-day closures use `POST /businesses/:id/block-days` instead.
+
+        The server validates:
+        - `date` must be today or a future date
+        - `endTime` must be strictly after `startTime`
+        - The window must not overlap with an existing `booked` TimeSlot for the same staff + date
+
+        **Auth:** `OWNER`
+        **Tenant note:** `businessId` in path is verified against JWT claim.
+      operationId: blockTimeSlot
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateTimeSlotRequest'
+            example:
+              staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+              date: "2026-07-10"
+              startTime: "13:00"
+              endTime: "14:00"
+              reason: "Lunch break"
+      responses:
+        '201':
+          description: Time slot blocked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/TimeSlot'
+              example:
+                success: true
+                data:
+                  id: "64e5d6f7a8b9c0d1e2f3a4b5"
+                  businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                  staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                  date: "2026-07-10"
+                  startTime: "13:00"
+                  endTime: "14:00"
+                  status: "blocked"
+                  bookingId: null
+                  reason: "Lunch break"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Slot window conflicts with an existing booking
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "SLOT_UNAVAILABLE"
+                  message: "A booking already exists in this time window."
+                  statusCode: 409
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/timeslots:
+    get:
+      tags: [TimeSlots]
+      summary: List blocked slots for a business (Owner)
+      description: |
+        Returns all `TimeSlot` documents with `status: blocked` for the owner's
+        business, optionally filtered by date range and staff member. Used by the
+        dashboard slot calendar to render blocked (red) windows.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Scoped to `req.businessId` from JWT.
+      operationId: listBlockedSlots
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: date
+          in: query
+          required: false
+          description: Filter to a specific date (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+        - name: staffId
+          in: query
+          required: false
+          description: Filter by staff member
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          description: Start of date range (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: End of date range (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: List of blocked time slots
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TimeSlot'
+              example:
+                success: true
+                data:
+                  - id: "64e5d6f7a8b9c0d1e2f3a4b5"
+                    businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                    staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                    date: "2026-07-10"
+                    startTime: "13:00"
+                    endTime: "14:00"
+                    status: "blocked"
+                    bookingId: null
+                    reason: "Lunch break"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/timeslots/{slotId}/unblock:
+    delete:
+      tags: [TimeSlots]
+      summary: Unblock a time slot (Owner)
+      description: |
+        Deletes a `blocked` TimeSlot document, making that window available for
+        booking again. Returns `400` if the slot has `status: booked` — booked
+        slots cannot be unblocked directly; cancel the booking instead.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Tenant guard applied — slot's `businessId` must match JWT claim.
+      operationId: unblockTimeSlot
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: slotId
+          in: path
+          required: true
+          description: MongoDB ObjectId of the TimeSlot to unblock
+          schema:
+            type: string
+            pattern: '^[a-f\d]{24}$'
+          example: "64e5d6f7a8b9c0d1e2f3a4b5"
+      responses:
+        '200':
+          description: Slot unblocked successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              example:
+                success: true
+                data:
+                  message: "Slot unblocked successfully."
+        '400':
+          description: Cannot unblock a booked slot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "VALIDATION_ERROR"
+                  message: "This slot has an active booking and cannot be unblocked. Cancel the booking first."
+                  statusCode: 400
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # BOOKINGS
+  # ══════════════════════════════════════════
+
+  /bookings:
+    post:
+      tags: [Bookings]
+      summary: Create a booking — runs atomic conflict check
+      description: |
+        **The most critical endpoint in the system.** Creates an appointment using
+        a 3-phase atomic conflict-prevention algorithm (see PRD §8):
+
+        **Phase 1 — Re-validate availability:**
+        Before writing, query for any `confirmed` Booking where:
+        `businessId` + `staffId` + `date` match AND time windows overlap using
+        the condition: `existingStart < requestedEnd AND existingEnd > requestedStart`.
+
+        **Phase 2 — Atomic write (MongoDB transaction):**
+        If no conflict, open a `session.withTransaction()` and atomically:
+        - Insert the `Booking` document
+        - Insert a `TimeSlot` document (`status: booked`) guarded by a unique compound
+          index on `{ businessId, staffId, date, startTime }`
+
+        **Phase 3 — Duplicate key guard:**
+        If two concurrent requests both pass Phase 1 simultaneously, the second
+        write fails with MongoDB E11000 (duplicate key on the TimeSlot unique index).
+        The server catches this and returns `409 SLOT_UNAVAILABLE`.
+
+        On success, booking confirmation emails are sent asynchronously (fire-and-forget)
+        to both the customer and the business owner. Email failure never blocks the 201 response.
+
+        Guest bookings (no account) are fully supported — `customerId` will be null.
+
+        **Auth:** `PUBLIC | CUSTOMER`
+        **Tenant note:** `businessId` in request body is validated server-side against
+        the Business collection; it is not trusted blindly from the payload.
+      operationId: createBooking
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+            example:
+              businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+              serviceId: "64b2a3d4e5f6g7h8i9j0k1l2"
+              staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+              date: "2026-07-15"
+              startTime: "09:00"
+              customerName: "Rohan Kulkarni"
+              customerEmail: "rohan@example.com"
+              customerPhone: "9988776655"
+      responses:
+        '201':
+          description: Booking confirmed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Booking'
+              example:
+                success: true
+                data:
+                  id: "64d4c5f6a7b8c9d0e1f2a3b4"
+                  bookingRef: "BMS-00142"
+                  businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                  serviceId: "64b2a3d4e5f6g7h8i9j0k1l2"
+                  staffId: "64c3b4e5f6a7b8c9d0e1f2a3"
+                  customerId: null
+                  customerName: "Rohan Kulkarni"
+                  customerEmail: "rohan@example.com"
+                  customerPhone: "9988776655"
+                  date: "2026-07-15"
+                  startTime: "09:00"
+                  endTime: "09:45"
+                  status: "confirmed"
+                  cancelledBy: null
+                  cancellationReason: null
+                  emailSentAt: null
+                  createdAt: "2026-06-29T08:12:00.000Z"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          description: Business, service, or staff not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "NOT_FOUND"
+                  message: "The requested business or service was not found."
+                  statusCode: 404
+        '409':
+          description: Slot already taken — concurrent booking race condition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "SLOT_UNAVAILABLE"
+                  message: "This slot was just booked by someone else. Please choose another time."
+                  statusCode: 409
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /bookings/my:
+    get:
+      tags: [Bookings]
+      summary: List own bookings (Customer)
+      description: |
+        Returns all bookings for the authenticated customer — matched by
+        `customerId === req.user._id` OR `customerEmail === req.user.email`
+        (the email match captures guest bookings later claimed by an account).
+        Results are sorted by `date desc` (most recent first).
+        Includes denormalised `businessName`, `serviceName`, `staffName` for display.
+
+        **Auth:** `CUSTOMER`
+        **Tenant note:** Customer data is cross-tenant by design; a customer
+        may have bookings at multiple businesses.
+      operationId: getMyBookings
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Customer's booking history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/BookingCustomerView'
+              example:
+                success: true
+                data:
+                  - id: "64d4c5f6a7b8c9d0e1f2a3b4"
+                    bookingRef: "BMS-00142"
+                    businessName: "Sunshine Salon"
+                    serviceName: "Haircut & Styling"
+                    staffName: "Anjali Desai"
+                    date: "2026-07-15"
+                    startTime: "09:00"
+                    endTime: "09:45"
+                    status: "confirmed"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /bookings/all:
+    get:
+      tags: [Admin]
+      summary: List all bookings across businesses (Super Admin)
+      description: |
+        Returns paginated bookings across all tenants. Supports filtering by
+        `businessId`, `date`, and `status`. Each result includes `businessName`
+        for cross-tenant context. Used in the Super Admin console to monitor
+        platform-wide booking activity.
+
+        **Auth:** `ADMIN`
+        **Tenant note:** No tenant scope — Super Admin sees all bookings.
+      operationId: getAllBookings
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: businessId
+          in: query
+          required: false
+          description: Filter bookings to a specific business
+          schema:
+            type: string
+        - name: date
+          in: query
+          required: false
+          description: Filter by specific date (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [confirmed, cancelled, completed]
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: Paginated list of all bookings
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          bookings:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/BookingAdminView'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+              example:
+                success: true
+                data:
+                  bookings:
+                    - id: "64d4c5f6a7b8c9d0e1f2a3b4"
+                      bookingRef: "BMS-00142"
+                      businessName: "Sunshine Salon"
+                      customerName: "Rohan Kulkarni"
+                      serviceName: "Haircut & Styling"
+                      date: "2026-07-15"
+                      status: "confirmed"
+                  pagination:
+                    total: 1204
+                    page: 1
+                    limit: 20
+                    pages: 61
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /bookings/{id}:
+    get:
+      tags: [Bookings]
+      summary: Get a single booking by ID
+      description: |
+        Returns full booking details. Authorization rules:
+        - **OWNER**: can fetch any booking belonging to their business
+        - **CUSTOMER**: can only fetch bookings where `customerId` or `customerEmail` matches
+        - **ADMIN**: can fetch any booking
+
+        Returns `403` if the caller's role and ownership do not satisfy the above.
+
+        **Auth:** `OWNER | CUSTOMER | ADMIN`
+        **Tenant note:** Owner access is automatically scoped to their `businessId`.
+      operationId: getBookingById
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      responses:
+        '200':
+          description: Full booking detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/BookingPopulated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /bookings/{id}/cancel:
+    patch:
+      tags: [Bookings]
+      summary: Cancel a booking (Owner or Customer)
+      description: |
+        Cancels an existing confirmed booking. On success:
+        - Sets `status: cancelled`, records `cancelledBy` and `cancellationReason`
+        - Deletes the associated `TimeSlot` (status: `booked`), freeing it for rebooking
+        - Sends a cancellation email to the customer (async, non-blocking)
+        - If `cancelledBy === "business"` AND the appointment is within 1 hour, an
+          additional apology email is sent to the customer
+
+        Authorization:
+        - **CUSTOMER**: can cancel only their own booking; cancellation must be
+          ≥ 1 hour before `startTime` (configurable per business via `cancellationWindowMinutes`)
+        - **OWNER**: can cancel any booking within their tenant; the 1-hour rule can be
+          overridden by the owner
+        - **ADMIN**: can cancel any booking
+
+        **Auth:** `OWNER | CUSTOMER | ADMIN`
+        **Tenant note:** Owner is scoped to their `businessId`.
+      operationId: cancelBooking
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelBookingRequest'
+            examples:
+              customerCancel:
+                summary: Customer cancels their own booking
+                value:
+                  cancelledBy: "customer"
+                  cancellationReason: "Change of plans"
+              ownerCancel:
+                summary: Business cancels a booking
+                value:
+                  cancelledBy: "business"
+                  cancellationReason: "Staff member is unwell"
+      responses:
+        '200':
+          description: Booking cancelled
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Booking'
+              example:
+                success: true
+                data:
+                  id: "64d4c5f6a7b8c9d0e1f2a3b4"
+                  bookingRef: "BMS-00142"
+                  status: "cancelled"
+                  cancelledBy: "customer"
+                  cancellationReason: "Change of plans"
+        '400':
+          description: Cancellation window has passed or booking already cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                error:
+                  code: "VALIDATION_ERROR"
+                  message: "Cancellations must be made at least 1 hour before the appointment."
+                  statusCode: 400
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /bookings/{id}/status:
+    put:
+      tags: [Bookings]
+      summary: Update booking status — confirm, complete, or cancel (Owner)
+      description: |
+        Allows the Business Owner to transition a booking to `cancelled` or `completed`.
+        - `confirmed → cancelled`: Frees the associated TimeSlot. Cancellation email
+          sent to customer. If cancelled less than 1 hour before appointment time,
+          an apology email is also triggered automatically.
+        - `confirmed → completed`: Marks appointment as done. No slot or email changes.
+
+        This endpoint is distinct from `PATCH /bookings/:id/cancel` — that one is
+        designed for the customer-facing cancellation flow. This one is for the
+        owner dashboard's booking management controls.
+
+        **Auth:** `OWNER | ADMIN`
+        **Tenant note:** Owner can only update bookings in their own business.
+      operationId: updateBookingStatus
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBookingStatusRequest'
+            examples:
+              cancel:
+                summary: Owner cancels a booking
+                value:
+                  status: "cancelled"
+                  cancelledBy: "business"
+                  cancellationReason: "Staff member called in sick"
+              complete:
+                summary: Owner marks appointment as completed
+                value:
+                  status: "completed"
+      responses:
+        '200':
+          description: Booking status updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /businesses/{businessId}/bookings:
+    get:
+      tags: [Bookings]
+      summary: List all bookings for a business (Owner view)
+      description: |
+        Returns paginated bookings for the authenticated owner's business.
+        Supports filtering by date, status, and staffId. Results include
+        denormalised `serviceName` and `staffName` for display efficiency.
+        Default sort: `date asc, startTime asc`.
+
+        **Auth:** `OWNER | ADMIN`
+        **Tenant note:** Owner's JWT `businessId` must match the `businessId` path param.
+        Admin bypasses this check.
+        **Performance target:** < 1500ms p95 with compound indexes in place.
+      operationId: listBusinessBookings
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: date
+          in: query
+          required: false
+          description: Filter by specific date (`YYYY-MM-DD`)
+          schema:
+            type: string
+            format: date
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [confirmed, cancelled, completed]
+        - name: staffId
+          in: query
+          required: false
+          description: Filter by staff member
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: Paginated list of business bookings
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          bookings:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/BookingPopulated'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+              example:
+                success: true
+                data:
+                  bookings:
+                    - id: "64d4c5f6a7b8c9d0e1f2a3b4"
+                      bookingRef: "BMS-00142"
+                      customerName: "Rohan Kulkarni"
+                      customerEmail: "rohan@example.com"
+                      serviceName: "Haircut & Styling"
+                      staffName: "Anjali Desai"
+                      date: "2026-07-15"
+                      startTime: "09:00"
+                      endTime: "09:45"
+                      status: "confirmed"
+                  pagination:
+                    total: 38
+                    page: 1
+                    limit: 20
+                    pages: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # ANALYTICS
+  # ══════════════════════════════════════════
+
+  /analytics/summary:
+    get:
+      tags: [Analytics]
+      summary: Get booking and revenue summary (Owner)
+      description: |
+        Aggregates booking data for the owner's business over a specified date range
+        using a MongoDB aggregation pipeline. Returns total bookings, revenue,
+        cancellation count and rate, plus today-specific stats.
+
+        Defaults to the current calendar month if `from`/`to` are not provided.
+        All monetary values are in INR.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Strictly scoped to `req.businessId` from JWT.
+        **Performance target:** < 1500ms p95 with compound indexes.
+      operationId: getAnalyticsSummary
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Start date (`YYYY-MM-DD`); defaults to first of current month
+          schema:
+            type: string
+            format: date
+          example: "2026-06-01"
+        - name: to
+          in: query
+          required: false
+          description: End date (`YYYY-MM-DD`); defaults to today
+          schema:
+            type: string
+            format: date
+          example: "2026-06-29"
+      responses:
+        '200':
+          description: Analytics summary for the date range
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AnalyticsSummary'
+              example:
+                success: true
+                data:
+                  period:
+                    from: "2026-06-01"
+                    to: "2026-06-29"
+                  totalBookings: 87
+                  confirmedBookings: 74
+                  cancelledBookings: 13
+                  cancellationRate: 14.94
+                  totalRevenueINR: 62500
+                  bookingsToday: 6
+                  revenueToday: 4200
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /analytics/peak-hours:
+    get:
+      tags: [Analytics]
+      summary: Get booking frequency by hour of day (Owner)
+      description: |
+        Aggregates confirmed bookings by hour of `startTime` for the owner's business
+        within a date range. Returns an array of 24 hour buckets sorted by hour.
+        Used to render the peak hours bar chart on the owner dashboard.
+
+        **Auth:** `OWNER`
+        **Tenant note:** Scoped to `req.businessId`.
+      operationId: getPeakHours
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Start date (`YYYY-MM-DD`); defaults to first of current month
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: End date (`YYYY-MM-DD`); defaults to today
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Hourly booking frequency
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          period:
+                            $ref: '#/components/schemas/DatePeriod'
+                          peakHours:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/PeakHourEntry'
+              example:
+                success: true
+                data:
+                  period:
+                    from: "2026-06-01"
+                    to: "2026-06-29"
+                  peakHours:
+                    - hour: 9
+                      bookingCount: 12
+                    - hour: 10
+                      bookingCount: 18
+                    - hour: 11
+                      bookingCount: 21
+                    - hour: 16
+                      bookingCount: 15
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /analytics/all:
+    get:
+      tags: [Admin]
+      summary: Get platform-wide analytics (Super Admin)
+      description: |
+        Returns a platform-level aggregation across all tenants:
+        total registered businesses, total bookings, bookings today,
+        global cancellation rate, and top 5 businesses by booking count.
+
+        **Auth:** `ADMIN`
+        **Tenant note:** No tenant scope — aggregates all tenants.
+      operationId: getPlatformAnalytics
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Platform-wide analytics summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PlatformAnalytics'
+              example:
+                success: true
+                data:
+                  totalBusinesses: 34
+                  activeBusinesses: 31
+                  totalBookings: 4812
+                  bookingsToday: 87
+                  globalCancellationRate: 11.2
+                  topBusinesses:
+                    - businessId: "64a1f2c3e4b5d6f7a8b9c0d2"
+                      name: "Sunshine Salon"
+                      bookingCount: 312
+                    - businessId: "64a1f2c3e4b5d6f7a8b9c0d8"
+                      name: "City Clinic"
+                      bookingCount: 289
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ══════════════════════════════════════════
+  # DASHBOARD (combined summary endpoint)
+  # ══════════════════════════════════════════
+
+  /businesses/{businessId}/dashboard:
+    get:
+      tags: [Analytics]
+      summary: Owner dashboard summary — stats + today's schedule + peak hours
+      description: |
+        Combines analytics summary, peak hours, and today's schedule into a single
+        response to minimise frontend round-trips on dashboard load.
+        Powered by parallel MongoDB aggregation pipelines.
+
+        Default range: current calendar month if `from`/`to` not provided.
+        All monetary values are in INR. All times displayed in IST (UTC+5:30).
+
+        **Auth:** `OWNER | ADMIN`
+        **Tenant note:** Owner JWT `businessId` must match path param. Admin bypasses.
+        **Performance target:** < 1500ms p95.
+      operationId: getDashboard
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/businessId'
+        - name: from
+          in: query
+          required: false
+          description: Start of analytics date range (`YYYY-MM-DD`); defaults to first of current month
+          schema:
+            type: string
+            format: date
+          example: "2026-06-01"
+        - name: to
+          in: query
+          required: false
+          description: End of analytics date range (`YYYY-MM-DD`); defaults to today
+          schema:
+            type: string
+            format: date
+          example: "2026-06-29"
+      responses:
+        '200':
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DashboardSummary'
+              example:
+                success: true
+                data:
+                  period:
+                    from: "2026-06-01"
+                    to: "2026-06-29"
+                  stats:
+                    totalBookings: 87
+                    confirmedBookings: 74
+                    cancelledBookings: 13
+                    cancellationRate: 14.94
+                    totalRevenueINR: 62500
+                    bookingsToday: 6
+                    revenueToday: 4200
+                  peakHours:
+                    - hour: 10
+                      bookingCount: 18
+                    - hour: 11
+                      bookingCount: 21
+                    - hour: 16
+                      bookingCount: 15
+                  todaySchedule:
+                    - bookingRef: "BMS-00201"
+                      customerName: "Sneha Patil"
+                      serviceName: "Haircut & Styling"
+                      staffName: "Anjali Desai"
+                      startTime: "10:00"
+                      endTime: "10:45"
+                      status: "confirmed"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+# ─────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by `POST /api/auth/login`. Payload: `{ userId, role, businessId }`.
+        Expires in 7 days. Include as `Authorization: Bearer <token>`.
+
+  # ── PARAMETERS ───────────────────────────────
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      description: MongoDB ObjectId of the resource
+      schema:
+        type: string
+        pattern: '^[a-f\d]{24}$'
+      example: "64a1f2c3e4b5d6f7a8b9c0d2"
+
+    slug:
+      name: slug
+      in: path
+      required: true
+      description: URL-safe unique business slug (e.g., `sunshine-salon`)
+      schema:
+        type: string
+        pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+      example: "sunshine-salon"
+
+    businessId:
+      name: businessId
+      in: path
+      required: true
+      description: MongoDB ObjectId of the business (tenant identifier)
+      schema:
+        type: string
+        pattern: '^[a-f\d]{24}$'
+      example: "64a1f2c3e4b5d6f7a8b9c0d2"
+
+    serviceId:
+      name: serviceId
+      in: path
+      required: true
+      description: MongoDB ObjectId of the service
+      schema:
+        type: string
+        pattern: '^[a-f\d]{24}$'
+      example: "64b2a3d4e5f6g7h8i9j0k1l2"
+
+    staffId:
+      name: staffId
+      in: path
+      required: true
+      description: MongoDB ObjectId of the staff member
+      schema:
+        type: string
+        pattern: '^[a-f\d]{24}$'
+      example: "64c3b4e5f6a7b8c9d0e1f2a3"
+
+  # ── SCHEMAS ──────────────────────────────────
+  schemas:
+
+    # ──────────── Enums ────────────
+
+    Role:
+      type: string
+      enum: [customer, business_owner, super_admin]
+      description: User role — determines access scope and JWT payload content
+
+    BusinessCategory:
+      type: string
+      enum: [salon, clinic, coaching, other]
+      description: Type of local service business
+
+    BookingStatus:
+      type: string
+      enum: [confirmed, cancelled, completed]
+      description: Lifecycle state of a booking
+
+    SlotStatus:
+      type: string
+      enum: [blocked, booked]
+      description: State of a stored TimeSlot document
+
+    DayOfWeek:
+      type: string
+      enum: [monday, tuesday, wednesday, thursday, friday, saturday, sunday]
+      description: Day of the week in lowercase English
+
+    # ──────────── Shared Sub-objects ────────────
+
+    WorkingHoursEntry:
+      type: object
+      required: [day, start, end]
+      properties:
+        day:
+          $ref: '#/components/schemas/DayOfWeek'
+        start:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          description: Opening time in `HH:MM` 24-hour format
+          example: "09:00"
+        end:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          description: Closing time in `HH:MM` 24-hour format; must be after `start`
+          example: "19:00"
+
+    Pagination:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of matching records
+          example: 38
+        page:
+          type: integer
+          description: Current page number (1-indexed)
+          example: 1
+        limit:
+          type: integer
+          description: Records returned per page
+          example: 20
+        pages:
+          type: integer
+          description: Total number of pages
+          example: 2
+
+    DatePeriod:
+      type: object
+      properties:
+        from:
+          type: string
+          format: date
+          example: "2026-06-01"
+        to:
+          type: string
+          format: date
+          example: "2026-06-29"
+
+    # ──────────── Response Envelopes ────────────
+
+    SuccessEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+          description: Always `true` for successful responses
+        data:
+          type: object
+          description: Response payload — shape varies per endpoint
+
+    ErrorEnvelope:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+          description: Always `false` for error responses
+        error:
+          type: object
+          required: [code, message, statusCode]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: "VALIDATION_ERROR"
+            message:
+              type: string
+              description: Human-readable description for the UI to display
+              example: "durationMinutes must be a positive multiple of 15."
+            statusCode:
+              type: integer
+              description: HTTP status code mirrored in the body for client convenience
+              example: 400
+
+    # ──────────── Auth ────────────
+
+    RegisterOwnerRequest:
+      type: object
+      required: [name, email, password, phone, businessName, category, city]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: Full name of the business owner
+          example: "Priya Sharma"
+        email:
+          type: string
+          format: email
+          description: Owner email — must be globally unique across all users
+          example: "priya@sunshinesalon.in"
+        password:
+          type: string
+          minLength: 8
+          description: Minimum 8 characters; stored as bcrypt hash (salt rounds ≥ 10)
+          example: "Secure@123"
+        phone:
+          type: string
+          pattern: '^[6-9]\d{9}$'
+          description: 10-digit Indian mobile number
+          example: "9876543210"
+        businessName:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: Name of the business — used to auto-generate the slug
+          example: "Sunshine Salon"
+        category:
+          $ref: '#/components/schemas/BusinessCategory'
+        city:
+          type: string
+          minLength: 2
+          maxLength: 60
+          example: "Pune"
+        description:
+          type: string
+          maxLength: 500
+          description: Optional short description of the business
+          example: "Premium unisex salon in Koregaon Park"
+
+    RegisterCustomerRequest:
+      type: object
+      required: [name, email, password, phone]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: "Rohan Kulkarni"
+        email:
+          type: string
+          format: email
+          description: Must be globally unique across all users
+          example: "rohan@example.com"
+        password:
+          type: string
+          minLength: 8
+          example: "MyPass@456"
+        phone:
+          type: string
+          pattern: '^[6-9]\d{9}$'
+          example: "9988776655"
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: "priya@sunshinesalon.in"
+        password:
+          type: string
+          example: "Secure@123"
+
+    AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [token, user]
+              properties:
+                token:
+                  type: string
+                  description: Signed JWT — 7d expiry. Include as `Authorization: Bearer <token>`.
+                  example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                user:
+                  $ref: '#/components/schemas/UserProfile'
+
+    UserProfile:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d1"
+        name:
+          type: string
+          example: "Priya Sharma"
+        email:
+          type: string
+          format: email
+          example: "priya@sunshinesalon.in"
+        role:
+          $ref: '#/components/schemas/Role'
+        businessId:
+          type: string
+          nullable: true
+          description: ObjectId of the owner's business; null for customers and super_admin
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        phone:
+          type: string
+          nullable: true
+          example: "9876543210"
+
+    # ──────────── Business ────────────
+
+    CreateBusinessRequest:
+      type: object
+      required: [name, category, city, phone]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: "Sunshine Salon"
+        category:
+          $ref: '#/components/schemas/BusinessCategory'
+        city:
+          type: string
+          minLength: 2
+          maxLength: 60
+          example: "Pune"
+        phone:
+          type: string
+          pattern: '^[6-9]\d{9}$'
+          example: "9876543210"
+        description:
+          type: string
+          maxLength: 500
+          example: "Premium unisex salon"
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+          description: Business working hours by day; days omitted are treated as closed
+        bufferMinutes:
+          type: integer
+          minimum: 0
+          maximum: 60
+          default: 0
+          description: Gap in minutes between consecutive appointments
+
+    UpdateBusinessRequest:
+      type: object
+      description: All fields are optional — only provided fields are updated
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: If changed, slug is regenerated and checked for global uniqueness
+        phone:
+          type: string
+          pattern: '^[6-9]\d{9}$'
+        description:
+          type: string
+          maxLength: 500
+        bufferMinutes:
+          type: integer
+          minimum: 0
+          maximum: 60
+
+    SetWorkingHoursRequest:
+      type: object
+      required: [workingHours]
+      properties:
+        workingHours:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+          description: |
+            Replaces the entire `workingHours` array on the Business document.
+            Days omitted are treated as closed (no slots generated that day).
+
+    BlockDaysRequest:
+      type: object
+      required: [dates]
+      properties:
+        dates:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            type: string
+            format: date
+          description: Dates to block; must be today or future dates
+          example: ["2026-08-15", "2026-08-16"]
+        reason:
+          type: string
+          maxLength: 200
+          description: Optional closure reason stored on each TimeSlot document
+          example: "Independence Day long weekend"
+
+    SuspendBusinessRequest:
+      type: object
+      required: [isActive]
+      properties:
+        isActive:
+          type: boolean
+          description: "`false` to suspend; `true` to reactivate"
+          example: false
+        reason:
+          type: string
+          maxLength: 300
+          description: Reason recorded in AuditLog
+          example: "Fraudulent bookings reported"
+
+    Business:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        ownerId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d1"
+        name:
+          type: string
+          example: "Sunshine Salon"
+        slug:
+          type: string
+          example: "sunshine-salon"
+        category:
+          $ref: '#/components/schemas/BusinessCategory'
+        city:
+          type: string
+          example: "Pune"
+        phone:
+          type: string
+          example: "9876543210"
+        description:
+          type: string
+          nullable: true
+          example: "Premium unisex salon"
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+        bufferMinutes:
+          type: integer
+          example: 10
+        isActive:
+          type: boolean
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-01-10T06:00:00.000Z"
+
+    BusinessPublic:
+      description: Business fields safe to expose publicly (ownerId is excluded)
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        name:
+          type: string
+          example: "Sunshine Salon"
+        slug:
+          type: string
+          example: "sunshine-salon"
+        category:
+          $ref: '#/components/schemas/BusinessCategory'
+        city:
+          type: string
+          example: "Pune"
+        phone:
+          type: string
+          example: "9876543210"
+        description:
+          type: string
+          nullable: true
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+        bufferMinutes:
+          type: integer
+          example: 0
+        isActive:
+          type: boolean
+          example: true
+
+    BusinessAdminView:
+      description: Business summary row as shown in the Super Admin console
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        name:
+          type: string
+          example: "Sunshine Salon"
+        slug:
+          type: string
+          example: "sunshine-salon"
+        category:
+          $ref: '#/components/schemas/BusinessCategory'
+        city:
+          type: string
+          example: "Pune"
+        isActive:
+          type: boolean
+          example: true
+        bookingCount:
+          type: integer
+          description: Total bookings ever recorded for this business
+          example: 142
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-01-10T06:00:00.000Z"
+
+    # ──────────── Services ────────────
+
+    CreateServiceRequest:
+      type: object
+      required: [name, durationMinutes, priceINR]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: Must be unique (case-insensitive) within the business
+          example: "Haircut & Styling"
+        description:
+          type: string
+          maxLength: 300
+          example: "Precision cut with blowdry finish"
+        durationMinutes:
+          type: integer
+          multipleOf: 15
+          minimum: 15
+          maximum: 480
+          description: Must be a positive multiple of 15 (e.g. 15, 30, 45, 60, 90, 120)
+          example: 45
+        priceINR:
+          type: number
+          minimum: 0
+          description: Price in Indian Rupees; 0 is allowed for free consultations
+          example: 500
+
+    UpdateServiceRequest:
+      type: object
+      description: All fields are optional — only provided fields are updated
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 300
+        durationMinutes:
+          type: integer
+          multipleOf: 15
+          minimum: 15
+          maximum: 480
+        priceINR:
+          type: number
+          minimum: 0
+
+    Service:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64b2a3d4e5f6g7h8i9j0k1l2"
+        businessId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        name:
+          type: string
+          example: "Haircut & Styling"
+        description:
+          type: string
+          nullable: true
+          example: "Precision cut with blowdry finish"
+        durationMinutes:
+          type: integer
+          example: 45
+        priceINR:
+          type: number
+          example: 500
+        isActive:
+          type: boolean
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-01-15T10:30:00.000Z"
+
+    # ──────────── Staff ────────────
+
+    CreateStaffRequest:
+      type: object
+      required: [name, serviceIds]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: "Anjali Desai"
+        title:
+          type: string
+          maxLength: 60
+          description: Job title displayed on the customer booking page
+          example: "Senior Stylist"
+        serviceIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: ObjectIds of services this staff member can deliver; all must belong to the same business
+          example: ["64b2a3d4e5f6g7h8i9j0k1l2"]
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+          description: Per-staff working hour override; inherits business hours at query time if empty or omitted
+
+    UpdateStaffRequest:
+      type: object
+      description: All fields are optional
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        title:
+          type: string
+          maxLength: 60
+        serviceIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Re-validated against business services on update
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+
+    Staff:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        businessId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        name:
+          type: string
+          example: "Anjali Desai"
+        title:
+          type: string
+          nullable: true
+          example: "Senior Stylist"
+        serviceIds:
+          type: array
+          items:
+            type: string
+          example: ["64b2a3d4e5f6g7h8i9j0k1l2"]
+        workingHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkingHoursEntry'
+          description: Empty array means the staff inherits business working hours
+        isActive:
+          type: boolean
+          example: true
+
+    # ──────────── TimeSlots ────────────
+
+    GenerateTimeSlotRequest:
+      type: object
+      required: [date, startTime, endTime]
+      properties:
+        staffId:
+          type: string
+          nullable: true
+          description: Target staff member; null to block all staff for this window
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        date:
+          type: string
+          format: date
+          description: Must be today or a future date
+          example: "2026-07-10"
+        startTime:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          example: "13:00"
+        endTime:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          description: Must be strictly after `startTime`
+          example: "14:00"
+        reason:
+          type: string
+          maxLength: 200
+          description: Optional human-readable reason for the block
+          example: "Lunch break"
+
+    TimeSlot:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64e5d6f7a8b9c0d1e2f3a4b5"
+        businessId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        staffId:
+          type: string
+          nullable: true
+          description: Null means the block applies to all staff
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        date:
+          type: string
+          format: date
+          example: "2026-07-10"
+        startTime:
+          type: string
+          example: "13:00"
+        endTime:
+          type: string
+          example: "14:00"
+        status:
+          $ref: '#/components/schemas/SlotStatus'
+        bookingId:
+          type: string
+          nullable: true
+          description: References the Booking document when `status` is `booked`; null when `blocked`
+          example: null
+        reason:
+          type: string
+          nullable: true
+          example: "Lunch break"
+
+    AvailableSlot:
+      type: object
+      description: A computed available booking window — not stored in the database
+      properties:
+        startTime:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          example: "09:00"
+        endTime:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          example: "09:45"
+        staffId:
+          type: string
+          nullable: true
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        staffName:
+          type: string
+          nullable: true
+          example: "Anjali Desai"
+
+    # ──────────── Bookings ────────────
+
+    CreateBookingRequest:
+      type: object
+      required:
+        [businessId, serviceId, date, startTime, customerName, customerEmail, customerPhone]
+      properties:
+        businessId:
+          type: string
+          description: Target business (tenant). Validated server-side against the Business collection.
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        serviceId:
+          type: string
+          description: Service to book; must belong to the given business
+          example: "64b2a3d4e5f6g7h8i9j0k1l2"
+        staffId:
+          type: string
+          nullable: true
+          description: Preferred staff member ObjectId; null or omitted means "any available"
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        date:
+          type: string
+          format: date
+          description: Appointment date; must be today or within 30 days (configurable)
+          example: "2026-07-15"
+        startTime:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          description: Requested start time — must correspond to an available slot window
+          example: "09:00"
+        customerName:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: "Rohan Kulkarni"
+        customerEmail:
+          type: string
+          format: email
+          description: Confirmation and reminder emails are sent here
+          example: "rohan@example.com"
+        customerPhone:
+          type: string
+          pattern: '^[6-9]\d{9}$'
+          description: Used by the business to contact the customer if needed
+          example: "9988776655"
+
+    CancelBookingRequest:
+      type: object
+      required: [cancelledBy, cancellationReason]
+      properties:
+        cancelledBy:
+          type: string
+          enum: [customer, business]
+          description: Who is initiating the cancellation
+          example: "customer"
+        cancellationReason:
+          type: string
+          maxLength: 300
+          description: Human-readable reason stored on the booking and included in the cancellation email
+          example: "Change of plans"
+
+    UpdateBookingStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [cancelled, completed]
+          description: Only `cancelled` and `completed` are valid transitions via this endpoint
+          example: "cancelled"
+        cancelledBy:
+          type: string
+          enum: [customer, business]
+          description: Required when `status` is `cancelled`
+          example: "business"
+        cancellationReason:
+          type: string
+          maxLength: 300
+          description: Required when `status` is `cancelled`
+          example: "Staff member called in sick"
+
+    Booking:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64d4c5f6a7b8c9d0e1f2a3b4"
+        bookingRef:
+          type: string
+          description: Short human-readable reference ID in format `BMS-XXXXX`
+          example: "BMS-00142"
+        businessId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        serviceId:
+          type: string
+          example: "64b2a3d4e5f6g7h8i9j0k1l2"
+        staffId:
+          type: string
+          nullable: true
+          example: "64c3b4e5f6a7b8c9d0e1f2a3"
+        customerId:
+          type: string
+          nullable: true
+          description: Null for guest bookings
+          example: null
+        customerName:
+          type: string
+          example: "Rohan Kulkarni"
+        customerEmail:
+          type: string
+          format: email
+          example: "rohan@example.com"
+        customerPhone:
+          type: string
+          example: "9988776655"
+        date:
+          type: string
+          format: date
+          example: "2026-07-15"
+        startTime:
+          type: string
+          example: "09:00"
+        endTime:
+          type: string
+          description: Computed as `startTime + service.durationMinutes`
+          example: "09:45"
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        cancelledBy:
+          type: string
+          nullable: true
+          enum: [customer, business, null]
+          example: null
+        cancellationReason:
+          type: string
+          nullable: true
+          example: null
+        emailSentAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp when confirmation email was dispatched; null until sent
+          example: null
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-06-29T08:12:00.000Z"
+
+    BookingPopulated:
+      description: Booking with denormalised display fields added for UI rendering efficiency
+      allOf:
+        - $ref: '#/components/schemas/Booking'
+        - type: object
+          properties:
+            serviceName:
+              type: string
+              example: "Haircut & Styling"
+            staffName:
+              type: string
+              nullable: true
+              example: "Anjali Desai"
+
+    BookingCustomerView:
+      description: Booking shape shown on the customer's "My Bookings" page — includes businessName
+      allOf:
+        - $ref: '#/components/schemas/Booking'
+        - type: object
+          properties:
+            businessName:
+              type: string
+              example: "Sunshine Salon"
+            serviceName:
+              type: string
+              example: "Haircut & Styling"
+            staffName:
+              type: string
+              nullable: true
+              example: "Anjali Desai"
+
+    BookingAdminView:
+      description: Booking summary row as shown in the Super Admin cross-tenant console
+      type: object
+      properties:
+        id:
+          type: string
+          example: "64d4c5f6a7b8c9d0e1f2a3b4"
+        bookingRef:
+          type: string
+          example: "BMS-00142"
+        businessId:
+          type: string
+          example: "64a1f2c3e4b5d6f7a8b9c0d2"
+        businessName:
+          type: string
+          example: "Sunshine Salon"
+        customerName:
+          type: string
+          example: "Rohan Kulkarni"
+        serviceName:
+          type: string
+          example: "Haircut & Styling"
+        date:
+          type: string
+          format: date
+          example: "2026-07-15"
+        startTime:
+          type: string
+          example: "09:00"
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        createdAt:
+          type: string
+          format: date-time
+
+    # ──────────── Analytics ────────────
+
+    AnalyticsSummary:
+      type: object
+      properties:
+        period:
+          $ref: '#/components/schemas/DatePeriod'
+        totalBookings:
+          type: integer
+          description: All bookings in the period regardless of status
+          example: 87
+        confirmedBookings:
+          type: integer
+          example: 74
+        cancelledBookings:
+          type: integer
+          example: 13
+        cancellationRate:
+          type: number
+          format: float
+          description: Percentage — `(cancelledBookings / totalBookings) * 100`
+          example: 14.94
+        totalRevenueINR:
+          type: number
+          description: Sum of `service.priceINR` for all `confirmed` + `completed` bookings in range
+          example: 62500
+        bookingsToday:
+          type: integer
+          description: Confirmed bookings for today specifically (IST)
+          example: 6
+        revenueToday:
+          type: number
+          description: Revenue from today's confirmed/completed bookings (IST)
+          example: 4200
+
+    PeakHourEntry:
+      type: object
+      properties:
+        hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          description: Hour of day in 24-hour format (IST)
+          example: 11
+        bookingCount:
+          type: integer
+          description: Number of confirmed bookings that started in this hour
+          example: 21
+
+    PlatformAnalytics:
+      type: object
+      properties:
+        totalBusinesses:
+          type: integer
+          description: Total number of registered businesses on the platform
+          example: 34
+        activeBusinesses:
+          type: integer
+          description: Businesses with `isActive: true`
+          example: 31
+        totalBookings:
+          type: integer
+          description: Total bookings across all tenants ever
+          example: 4812
+        bookingsToday:
+          type: integer
+          description: Confirmed bookings created today across all tenants (IST)
+          example: 87
+        globalCancellationRate:
+          type: number
+          format: float
+          description: Platform-wide cancellation rate percentage
+          example: 11.2
+        topBusinesses:
+          type: array
+          maxItems: 5
+          description: Top 5 businesses by total booking count
+          items:
+            type: object
+            properties:
+              businessId:
+                type: string
+              name:
+                type: string
+              bookingCount:
+                type: integer
+
+    TodayScheduleEntry:
+      type: object
+      properties:
+        bookingRef:
+          type: string
+          example: "BMS-00201"
+        customerName:
+          type: string
+          example: "Sneha Patil"
+        serviceName:
+          type: string
+          example: "Haircut & Styling"
+        staffName:
+          type: string
+          nullable: true
+          example: "Anjali Desai"
+        startTime:
+          type: string
+          example: "10:00"
+        endTime:
+          type: string
+          example: "10:45"
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+
+    DashboardSummary:
+      type: object
+      description: Combined dashboard response minimising frontend round-trips
+      properties:
+        period:
+          $ref: '#/components/schemas/DatePeriod'
+        stats:
+          $ref: '#/components/schemas/AnalyticsSummary'
+        peakHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/PeakHourEntry'
+          description: Top booking hours sorted by `bookingCount` descending
+        todaySchedule:
+          type: array
+          items:
+            $ref: '#/components/schemas/TodayScheduleEntry'
+          description: All confirmed bookings for today sorted by `startTime` asc (IST)
+
+  # ── RESPONSES ────────────────────────────────
+  responses:
+    ValidationError:
+      description: Invalid or missing request field(s)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "VALIDATION_ERROR"
+              message: "durationMinutes must be a positive multiple of 15."
+              statusCode: 400
+
+    Unauthorized:
+      description: Missing, malformed, or expired JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "UNAUTHORIZED"
+              message: "Authentication token is missing or has expired."
+              statusCode: 401
+
+    Forbidden:
+      description: Authenticated but insufficient role or tenant mismatch
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "FORBIDDEN"
+              message: "You do not have permission to access this resource."
+              statusCode: 403
+
+    NotFound:
+      description: Requested resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "NOT_FOUND"
+              message: "The requested resource was not found."
+              statusCode: 404
+
+    RateLimited:
+      description: Too many requests — rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "RATE_LIMITED"
+              message: "Too many requests. Please wait and try again in 15 minutes."
+              statusCode: 429
+
+    InternalError:
+      description: Unexpected server error — check server logs
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            error:
+              code: "INTERNAL_ERROR"
+              message: "An unexpected error occurred. Please try again."
+              statusCode: 500
